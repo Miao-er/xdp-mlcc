@@ -67,7 +67,7 @@ struct xsk_socket_info {
 
 pthread_mutex_t free_mutex;
 static struct xdp_program *prog;
-int xsk_map_fd, stat_map_fd, queue_map_fd;
+int xsk_map_fd, queue_map_fd; // stat_map_fd, 
 bool custom_xsk = false;
 struct config cfg = {
 	.ifindex   = -1,
@@ -202,8 +202,8 @@ static void *stats_poll(void *arg)
 		previous_stats = xsk->stats;
 		__u32 key = 0;
         __u32 cnt;
-        bpf_map_lookup_elem(stat_map_fd, &key, &cnt);
-            printf("Packets counted: %u\n", cnt);
+        // bpf_map_lookup_elem(stat_map_fd, &key, &cnt);
+        //     printf("Packets counted: %u\n", cnt);
 		for(int i = 0; i < QUEUE_NUM; i++) {
 			__u32 value;
 			bpf_map_lookup_elem(queue_map_fd, &i, &value);
@@ -539,8 +539,8 @@ static void tx_and_process(struct config* cfg, struct xsk_socket_info *xsk)
 
 		// printf("this time send %d packets, completed %d packets\n", stock_frames,completed_frames);
 		end_t = gettime();
-		// if(end_t - start_t > 30 * 1e9)
-		// 	exit_application(0);	
+		if(end_t - start_t > 6 * 1e9)
+			exit_application(0);	
     }
 
 	double period = (end_t - start_t) / 1000000000.0;
@@ -636,15 +636,14 @@ int main(int argc, char **argv)
 				cfg.ifname, errmsg, err);
 			return err;
 		}
-
 		/* We also need to load the xsks_map */
 		map = bpf_object__find_map_by_name(xdp_program__bpf_obj(prog), "xsks_map");
 		xsk_map_fd = bpf_map__fd(map);
 		map = bpf_object__find_map_by_name(xdp_program__bpf_obj(prog), "queue_count_map");
 		queue_map_fd = bpf_map__fd(map);
-		map = bpf_object__find_map_by_name(xdp_program__bpf_obj(prog), "xdp_stats_map");
-		stat_map_fd = bpf_map__fd(map);
-		if (xsk_map_fd < 0 || stat_map_fd < 0) {
+		// map = bpf_object__find_map_by_name(xdp_program__bpf_obj(prog), "xdp_stats_map");
+		// stat_map_fd = bpf_map__fd(map);
+		if (xsk_map_fd < 0){ // || stat_map_fd < 0) {
 			fprintf(stderr, "ERROR: no xsks map found: %s\n",
 				strerror(xsk_map_fd));
 			exit(EXIT_FAILURE);
@@ -694,11 +693,11 @@ int main(int argc, char **argv)
 		}
 	}
 	pthread_t rx_thread;
-	//pthread_create(&rx_thread, NULL, &rx_and_process, xsk_socket);
+	pthread_create(&rx_thread, NULL, &rx_and_process, xsk_socket);
 
 	/* Receive and count packets than drop them */
-	//tx_and_process(&cfg, xsk_socket);
-	rx_and_process(xsk_socket);
+	tx_and_process(&cfg, xsk_socket);
+	//rx_and_process(xsk_socket);
 
 	/* Cleanup */
 	xsk_socket__delete(xsk_socket->xsk);

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 
 #include <linux/bpf.h>
+#include <xdp/xdp_sample.bpf.h>
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 #include <linux/if_link.h>
@@ -9,6 +10,8 @@
 #include <linux/udp.h>
 #include <linux/tcp.h>
 #include <linux/in.h>
+
+extern int bpf_xdp_metadata_rx_timestamp(const struct xdp_md *ctx,__u64 *timestamp) __ksym;
 
 struct {
 	__uint(type, BPF_MAP_TYPE_XSKMAP);
@@ -24,12 +27,12 @@ struct {
 	__uint(max_entries, 28);
 } queue_count_map SEC(".maps");
 
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__type(key, __u32);
-	__type(value, __u32);
-	__uint(max_entries, 64);
-} xdp_stats_map SEC(".maps");
+// struct {
+// 	__uint(type, BPF_MAP_TYPE_ARRAY);
+// 	__type(key, __u32);
+// 	__type(value, __u32);
+// 	__uint(max_entries, 64);
+// } xdp_stats_map SEC(".maps");
 
 SEC("xdp")
 int xdp_sock_prog(struct xdp_md *ctx)
@@ -37,11 +40,17 @@ int xdp_sock_prog(struct xdp_md *ctx)
 	int index = ctx->rx_queue_index;
 	void *data_end = (void *)(long)ctx->data_end;
     void *data = (void *)(long)ctx->data;
-
-    __u32 key = 0;
-    __u32 *cnt = bpf_map_lookup_elem(&xdp_stats_map, &key);
-    if (cnt)
-        (*cnt)++;
+    __UINT64_TYPE__ timestamp;
+    int ret = bpf_xdp_metadata_rx_timestamp(ctx, &timestamp);
+    if(ret == -EOPNOTSUPP)
+    {
+        bpf_printk("bpf_xdp_metadata_rx_timestamp not supported\n");
+    }
+        
+    // __u32 key = 0;
+    // __u32 *cnt = bpf_map_lookup_elem(&xdp_stats_map, &key);
+    // if (cnt)
+    //     (*cnt)++;
     __u32* value = bpf_map_lookup_elem(&queue_count_map, &index);
     if (value)
         (*value)++;

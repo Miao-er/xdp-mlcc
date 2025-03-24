@@ -1,3 +1,5 @@
+#ifndef __PARSE_HEADER_H
+#define __PARSE_HEADER_H
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/udp.h>
@@ -191,3 +193,4 @@ static void hex_dump(void *pkt, size_t length, uint64_t addr)
 	}
 	printf("\n");
 }
+#endif
