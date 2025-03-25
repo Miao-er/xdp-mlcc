@@ -122,6 +122,7 @@ static const struct option_wrapper long_options[] = {
 
 static bool global_exit;
 #define NANOSEC_PER_SEC 1000000000 /* 10^9 */
+static void exit_application(int signal);
 static uint64_t gettime(void)
 {
 	struct timespec t;
@@ -373,7 +374,9 @@ static bool process_ack(struct xsk_socket_info *xsk)
 static bool process_packet(struct xsk_socket_info *xsk,
 			   uint64_t addr, uint32_t len)
 {
-	struct ethhdr *eth_hdr = xsk_umem__get_data(xsk->umem->buffer, addr);
+	unsigned long* timestamp = xsk_umem__get_data(xsk->umem->buffer, addr);
+	// printf("timestamp:%lu\n", *timestamp);
+	struct ethhdr *eth_hdr = (struct ethhdr *)(timestamp + 1);
 	struct iphdr *ip_hdr = (struct iphdr *)(eth_hdr + 1);
 	assert(ip_hdr->protocol == IPPROTO_TCP);
 	struct tcphdr *tcp_hdr = (struct tcphdr *)(ip_hdr + 1);
@@ -383,6 +386,7 @@ static bool process_packet(struct xsk_socket_info *xsk,
 	// 	printf("tcp_hdr->rst:%d\n", tcp_hdr->rst);
 	// 	hex_dump(eth_hdr, len, addr);
 	// }
+// #define PARSER_TCPINT
 #ifdef PARSER_TCPINT
 	assert(tcp_hdr->doff == 8);
 	struct tcp_int_opt *tcp_int = (struct tcp_int_opt *)(tcp_hdr + 1);

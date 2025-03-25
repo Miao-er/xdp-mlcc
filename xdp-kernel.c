@@ -34,19 +34,34 @@ struct {
 	__uint(max_entries, 64);
 } xdp_stats_map SEC(".maps");
 
+struct metadata {
+    __u64 timestamp;
+};
 SEC("xdp")
 int xdp_sock_prog(struct xdp_md *ctx)
 {
 	int index = ctx->rx_queue_index;
-	void *data_end = (void *)(long)ctx->data_end;
-    void *data = (void *)(long)ctx->data;
-    __UINT64_TYPE__ timestamp;
-    int ret = bpf_xdp_metadata_rx_timestamp(ctx, &timestamp);
+    int ret;
+    ret = bpf_xdp_adjust_head(ctx, -(int)sizeof(__u64));
+    if (ret)
+    {
+        bpf_printk("bpf_xdp_adjust_head failed\n");
+        return XDP_ABORTED;
+    }
+    void *data = (void *)(long)ctx->data;//+ sizeof(unsigned long);
+    void *data_head = data + 8;
+    void *data_end = (void *)(long)ctx->data_end;
+    struct metadata *metadata = data;
+    if(metadata + 1 > data_end)
+        return XDP_ABORTED;
+    ret = bpf_xdp_metadata_rx_timestamp(ctx, &metadata->timestamp);
     if(ret == -EOPNOTSUPP)
     {
         bpf_printk("bpf_xdp_metadata_rx_timestamp not supported\n");
     }
-        
+    // if (metadata + 1 > data_end)
+	// 	return XDP_ABORTED;
+
     __u32 key = 0;
     __u32 *cnt = bpf_map_lookup_elem(&xdp_stats_map, &key);
     if (cnt)
@@ -56,8 +71,8 @@ int xdp_sock_prog(struct xdp_md *ctx)
         (*value)++;
         
     // 解析以太网头
-    struct ethhdr *eth = data;
-    if (data + sizeof(*eth) > data_end)
+    struct ethhdr *eth = data_head;
+    if ((void*)(eth + 1) > data_end)
         return XDP_PASS;
 
     // 仅处理 IPv4 数据包
@@ -65,8 +80,8 @@ int xdp_sock_prog(struct xdp_md *ctx)
         return XDP_PASS;
 
     // 解析 IP 头
-    struct iphdr *ip = data + sizeof(*eth);
-    if (data + sizeof(*eth) + sizeof(*ip) > data_end)
+    struct iphdr *ip = eth + 1;
+    if ((void*)(ip + 1) > data_end)
         return XDP_PASS;
 
     // 检查源 IP 是否为 192.168.67.129
@@ -79,15 +94,10 @@ int xdp_sock_prog(struct xdp_md *ctx)
     if (ip->protocol != IPPROTO_TCP)
         return XDP_PASS;
 
-    struct tcphdr *tcp = data + sizeof(*eth) + sizeof(*ip);
-    if (data + sizeof(*eth) + sizeof(*ip) + sizeof(*tcp) > data_end)
+    struct tcphdr *tcp = ip + 1;
+    if ((void*)(tcp + 1) > data_end)
         return XDP_PASS;
 
-    // else
-    // {
-    //     __u32 new_one = 1;
-    //     bpf_map_update_elem(&queue_count_map, &index, &new_one, BPF_ANY);
-    // }
 	if (bpf_map_lookup_elem(&xsks_map, &index))
     {
 		return bpf_redirect_map(&xsks_map, index, XDP_PASS);
