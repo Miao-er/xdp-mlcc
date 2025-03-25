@@ -27,12 +27,12 @@ struct {
 	__uint(max_entries, 28);
 } queue_count_map SEC(".maps");
 
-// struct {
-// 	__uint(type, BPF_MAP_TYPE_ARRAY);
-// 	__type(key, __u32);
-// 	__type(value, __u32);
-// 	__uint(max_entries, 64);
-// } xdp_stats_map SEC(".maps");
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, __u32);
+	__uint(max_entries, 64);
+} xdp_stats_map SEC(".maps");
 
 SEC("xdp")
 int xdp_sock_prog(struct xdp_md *ctx)
@@ -47,10 +47,10 @@ int xdp_sock_prog(struct xdp_md *ctx)
         bpf_printk("bpf_xdp_metadata_rx_timestamp not supported\n");
     }
         
-    // __u32 key = 0;
-    // __u32 *cnt = bpf_map_lookup_elem(&xdp_stats_map, &key);
-    // if (cnt)
-    //     (*cnt)++;
+    __u32 key = 0;
+    __u32 *cnt = bpf_map_lookup_elem(&xdp_stats_map, &key);
+    if (cnt)
+        (*cnt)++;
     __u32* value = bpf_map_lookup_elem(&queue_count_map, &index);
     if (value)
         (*value)++;

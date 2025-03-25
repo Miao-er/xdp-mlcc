@@ -67,7 +67,8 @@ struct xsk_socket_info {
 
 pthread_mutex_t free_mutex;
 static struct xdp_program *prog;
-int xsk_map_fd, queue_map_fd; // stat_map_fd, 
+struct bpf_program * bpf_prog;
+int xsk_map_fd, stat_map_fd, queue_map_fd; // 
 bool custom_xsk = false;
 struct config cfg = {
 	.ifindex   = -1,
@@ -202,8 +203,8 @@ static void *stats_poll(void *arg)
 		previous_stats = xsk->stats;
 		__u32 key = 0;
         __u32 cnt;
-        // bpf_map_lookup_elem(stat_map_fd, &key, &cnt);
-        //     printf("Packets counted: %u\n", cnt);
+        bpf_map_lookup_elem(stat_map_fd, &key, &cnt);
+            printf("Packets counted: %u\n", cnt);
 		for(int i = 0; i < QUEUE_NUM; i++) {
 			__u32 value;
 			bpf_map_lookup_elem(queue_map_fd, &i, &value);
@@ -382,19 +383,24 @@ static bool process_packet(struct xsk_socket_info *xsk,
 	// 	printf("tcp_hdr->rst:%d\n", tcp_hdr->rst);
 	// 	hex_dump(eth_hdr, len, addr);
 	// }
+#ifdef PARSER_TCPINT
 	assert(tcp_hdr->doff == 8);
 	struct tcp_int_opt *tcp_int = (struct tcp_int_opt *)(tcp_hdr + 1);
 	assert(tcp_int->kind == 0x72);
+#endif
 	int tx_idx;
 	if(tcp_hdr->ack == 0)
 	{
 
 		build_eth_header(eth_hdr, src_mac, dst_mac);
+
 		build_ip_header(ip_hdr,ip_hdr->daddr, ip_hdr->saddr, sizeof(struct tcp_int_opt));
 		build_tcp_header(tcp_hdr,ntohs(tcp_hdr->dest), ntohs(tcp_hdr->source),ntohl(tcp_hdr->ack_seq), 
 			ntohl(tcp_hdr->seq) + ntohs(ip_hdr->tot_len) - sizeof(struct iphdr) - sizeof(struct tcphdr) - sizeof(struct tcp_int_opt), true, true);
+#ifdef PARSER_TCPINT		
 		parser_tcpint_header(tcp_int, &xsk->istate);
 		build_tcpint_header(tcp_int, &xsk->istate);
+#endif
 		while(xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx) < 1);
 		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = addr;
 		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = sizeof(struct ethhdr) +  sizeof(struct iphdr) + sizeof(struct tcphdr) + sizeof(struct tcp_int_opt);
@@ -459,13 +465,20 @@ static void handle_receive_packets(struct xsk_socket_info *xsk)
 	recvfrom(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, NULL);
 }
 
+static int my_do_unload(struct config* cfg)
+{
+	char unload_s[256];
+	sprintf(unload_s,"bpftool net detach xdp dev %s",cfg->ifname);
+	system(unload_s);
+	return 0;
+}
 static void exit_application(int signal)
 {
 	int err;
-	end_t = gettime();
+	//end_t = gettime();
 	printf("start to recycle resourece and exit application...\n");
 	cfg.unload_all = true;
-	err = do_unload(&cfg);
+	err = my_do_unload(&cfg);
 	printf("do_unload return %d\n", err);
 	if (err) {
 		fprintf(stderr, "Couldn't detach XDP program on iface '%s' : (%d)\n",
@@ -607,42 +620,31 @@ int main(int argc, char **argv)
 	/* Load custom program if configured */
 	if (cfg.filename[0] != 0) {
 		struct bpf_map *map;
-
 		custom_xsk = true;
-		xdp_opts.open_filename = cfg.filename;
-		xdp_opts.prog_name = cfg.progname;
-		xdp_opts.opts = &opts;
-
-		if (cfg.progname[0] != 0) {
-			xdp_opts.open_filename = cfg.filename;
-			xdp_opts.prog_name = cfg.progname;
-			xdp_opts.opts = &opts;
-
-			prog = xdp_program__create(&xdp_opts);
-		} else {
-			prog = xdp_program__open_file(cfg.filename,
-						  NULL, &opts);
-		}
-		err = libxdp_get_error(prog);
+		struct bpf_object* obj = bpf_object__open(cfg.filename);
+		bpf_prog = bpf_object__find_program_by_name(obj, cfg.progname);
+		bpf_program__set_ifindex(bpf_prog, cfg.ifindex);
+		bpf_program__set_flags(bpf_prog, BPF_F_XDP_DEV_BOUND_ONLY);
+		err = bpf_object__load(obj);
 		if (err) {
-			libxdp_strerror(err, errmsg, sizeof(errmsg));
+			libbpf_strerror(err, errmsg, sizeof(errmsg));
 			fprintf(stderr, "ERR: loading program: %s\n", errmsg);
 			return err;
 		}
-		err = xdp_program__attach(prog, cfg.ifindex, cfg.attach_mode, 0);
+		err = bpf_xdp_attach(cfg.ifindex, bpf_program__fd(bpf_prog), XDP_FLAGS_DRV_MODE,NULL);
 		if (err) {
-			libxdp_strerror(err, errmsg, sizeof(errmsg));
-			fprintf(stderr, "Couldn't attach XDP program on iface '%s' : %s (%d)\n",
-				cfg.ifname, errmsg, err);
+			libbpf_strerror(err, errmsg, sizeof(errmsg));
+			fprintf(stderr, "ERR: bpf_xdp_attach: %s\n", errmsg);
 			return err;
 		}
+
 		/* We also need to load the xsks_map */
-		map = bpf_object__find_map_by_name(xdp_program__bpf_obj(prog), "xsks_map");
+		map = bpf_object__find_map_by_name(obj, "xsks_map");
 		xsk_map_fd = bpf_map__fd(map);
-		map = bpf_object__find_map_by_name(xdp_program__bpf_obj(prog), "queue_count_map");
+		map = bpf_object__find_map_by_name(obj, "queue_count_map");
 		queue_map_fd = bpf_map__fd(map);
-		// map = bpf_object__find_map_by_name(xdp_program__bpf_obj(prog), "xdp_stats_map");
-		// stat_map_fd = bpf_map__fd(map);
+		map = bpf_object__find_map_by_name(obj, "xdp_stats_map");
+		stat_map_fd = bpf_map__fd(map);
 		if (xsk_map_fd < 0){ // || stat_map_fd < 0) {
 			fprintf(stderr, "ERROR: no xsks map found: %s\n",
 				strerror(xsk_map_fd));
