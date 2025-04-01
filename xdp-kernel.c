@@ -43,25 +43,23 @@ int xdp_sock_prog(struct xdp_md *ctx)
 	int index = ctx->rx_queue_index;
     int ret;
     ret = bpf_xdp_adjust_head(ctx, -(int)sizeof(__u64));
-    if (ret)
-    {
-        bpf_printk("bpf_xdp_adjust_head failed\n");
-        return XDP_ABORTED;
-    }
+    // if (ret)
+    // {
+    //     bpf_printk("bpf_xdp_adjust_head failed\n");
+    //     return XDP_ABORTED;
+    // }
     void *data = (void *)(long)ctx->data;//+ sizeof(unsigned long);
     void *data_head = data + 8;
     void *data_end = (void *)(long)ctx->data_end;
     struct metadata *metadata = data;
     if(metadata + 1 > data_end)
         return XDP_ABORTED;
-    ret = bpf_xdp_metadata_rx_timestamp(ctx, &metadata->timestamp);
-    if(ret == -EOPNOTSUPP)
+    metadata->timestamp = bpf_ktime_get_tai_ns();
+    // ret = bpf_xdp_metadata_rx_timestamp(ctx, &metadata->timestamp);
+    // if(ret == -EOPNOTSUPP)
     {
-        bpf_printk("bpf_xdp_metadata_rx_timestamp not supported\n");
+        bpf_printk("timestamp: %llu\n", metadata->timestamp);
     }
-    // if (metadata + 1 > data_end)
-	// 	return XDP_ABORTED;
-
     __u32 key = 0;
     __u32 *cnt = bpf_map_lookup_elem(&xdp_stats_map, &key);
     if (cnt)

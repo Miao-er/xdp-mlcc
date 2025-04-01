@@ -13,19 +13,21 @@
 #include <assert.h>
 #include <sys/resource.h>
 #include <bpf/bpf.h>
-#include <xdp/xsk.h>
 #include <xdp/libxdp.h>
-#include <net/if.h>
+#include <xdp/xsk.h> // Include this to define struct xsk_umem
 #include <linux/if_link.h>
+#include <linux/if_xdp.h>
+#include <linux/net_tstamp.h>
+#include <linux/sockios.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <sys/mman.h>
 #include "./common_user_bpf_xdp.h"
 #include "./common_params.h"
 #include "parse_header.h"
+#include "powertcp.h"
 // #include "./common_libbpf.h"
-#define NUM_FRAMES         2 * XSK_RING_CONS__DEFAULT_NUM_DESCS
-#define FRAME_SIZE         XSK_UMEM__DEFAULT_FRAME_SIZE
-#define RX_BATCH_SIZE      64
-#define INVALID_UMEM_FRAME UINT64_MAX
-#define ETH_ALEN 6
+
 #define DEST_IP "192.168.1.2"
 #define SRC_IP "192.168.1.1"
 #define QUEUE_NUM 28
@@ -34,12 +36,7 @@ const uint8_t src_mac[ETH_ALEN] = {0x08, 0xc0, 0xeb, 0xa2, 0x81, 0x01}; // 源 M
 const uint8_t dst_mac[ETH_ALEN] = {0x00, 0x77, 0x66, 0x55, 0x44, 0x33}; // 目标 MAC 地址 00:0c:29:39:25:dd
 const uint16_t SRC_PORT = 54321;
 const uint16_t DEST_PORT = 12345;
-struct xsk_umem_info {
-	struct xsk_ring_prod fq;
-	struct xsk_ring_cons cq;
-	struct xsk_umem *umem;
-	void *buffer;
-};
+
 struct stats_record {
 	uint64_t timestamp;
 	uint64_t rx_packets;
@@ -60,7 +57,11 @@ struct xsk_socket_info {
 	uint32_t unack_seq;
 	uint32_t send_seq;
 	uint32_t recv_seq;
+    uint64_t base_rtt;
+    uint64_t start_ts;
+    uint64_t timestamp;
 	struct tcp_int_state istate;
+    struct powertcp_info ptcp_info;
 	struct stats_record stats;
 	struct stats_record prev_stats;
 };
@@ -220,7 +221,80 @@ static inline __u32 xsk_ring_prod__free(struct xsk_ring_prod *r)
 	r->cached_cons = *r->consumer + r->size;
 	return r->cached_cons - r->cached_prod;
 }
+struct list_head {
+	struct list_head *next, *prev;
+};
+struct xsk_umem {
+	struct xsk_ring_prod *fill_save;
+	struct xsk_ring_cons *comp_save;
+	char *umem_area;
+	struct xsk_umem_config config;
+	int fd;
+	int refcount;
+	struct list_head ctx_list;
+	bool rx_ring_setup_done;
+	bool tx_ring_setup_done;
+};
 
+static struct xsk_umem_info * configure_my_xsk_umem(void* buffer,uint64_t size)
+{
+	struct xsk_umem_info *umem;
+	struct xdp_umem_reg mr;
+	int ret;
+	umem = calloc(1, sizeof(*umem));
+	umem->buffer = buffer;
+	if (!umem)
+		return NULL;
+	umem->umem = calloc(1, sizeof(*(umem->umem)));
+	umem->umem->fd = socket(AF_XDP, SOCK_RAW, 0);
+	umem->umem->umem_area = buffer;
+	umem->umem->ctx_list.next = &(umem->umem->ctx_list);
+	umem->umem->ctx_list.prev = &(umem->umem->ctx_list);
+	umem->umem->config.fill_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
+	umem->umem->config.comp_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
+	umem->umem->config.frame_size = XSK_UMEM__DEFAULT_FRAME_SIZE;
+	umem->umem->config.frame_headroom = sizeof(struct xsk_tx_metadata);//0;
+	umem->umem->config.flags = XDP_UMEM_TX_METADATA_LEN;//0; 
+
+	memset(&mr, 0, sizeof(mr));
+	mr.addr = (uintptr_t)buffer;
+	mr.len = size;
+	mr.chunk_size = umem->umem->config.frame_size;
+	mr.headroom = umem->umem->config.frame_headroom;
+	mr.flags = umem->umem->config.flags;
+	mr.tx_metadata_len = sizeof(struct xsk_tx_metadata);//0;
+	setsockopt(umem->umem->fd, SOL_XDP, XDP_UMEM_REG, &mr, sizeof(mr));
+
+	void *map;
+	int err;
+
+	err = setsockopt(umem->umem->fd, SOL_XDP, XDP_UMEM_FILL_RING, &umem->umem->config.fill_size, sizeof(umem->umem->config.fill_size));
+	err = setsockopt(umem->umem->fd, SOL_XDP, XDP_UMEM_COMPLETION_RING, &umem->umem->config.comp_size, sizeof(umem->umem->config.comp_size));
+	struct xdp_mmap_offsets off = {};
+	socklen_t optlen;
+	err = getsockopt(umem->umem->fd, SOL_XDP, XDP_MMAP_OFFSETS, &off, &optlen);
+	map = mmap(NULL, off.fr.desc + umem->umem->config.fill_size * sizeof(__u64), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, umem->umem->fd, XDP_UMEM_PGOFF_FILL_RING);
+	umem->fq.mask = umem->umem->config.fill_size - 1;
+	umem->fq.size = umem->umem->config.fill_size;
+	umem->fq.producer = map + off.fr.producer;
+	umem->fq.consumer = map + off.fr.consumer;
+	umem->fq.flags = map + off.fr.flags;
+	umem->fq.ring = map + off.fr.desc;
+	umem->fq.cached_cons = umem->umem->config.fill_size;
+	map = mmap(NULL, off.cr.desc + umem->umem->config.comp_size * sizeof(__u64), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,  umem->umem->fd, XDP_UMEM_PGOFF_COMPLETION_RING);
+	umem->cq.mask = umem->umem->config.comp_size - 1;
+	umem->cq.size = umem->umem->config.comp_size;
+	umem->cq.producer = map + off.cr.producer;
+	umem->cq.consumer = map + off.cr.consumer;
+	umem->cq.flags = map + off.cr.flags;
+	umem->cq.ring = map + off.cr.desc;
+
+	umem->umem->fill_save = &umem->fq;
+	umem->umem->comp_save = &umem->cq;
+
+	return umem;
+
+}
 static struct xsk_umem_info *configure_xsk_umem(void *buffer, uint64_t size)
 {
 	struct xsk_umem_info *umem;
@@ -333,7 +407,6 @@ static struct xsk_socket_info *xsk_configure_socket(struct config *cfg,
 	xsk_ring_prod__submit(&xsk_info->umem->fq,
 			      XSK_RING_PROD__DEFAULT_NUM_DESCS);
 	recvfrom(xsk_socket__fd(xsk_info->xsk), NULL, 0, MSG_DONTWAIT, NULL, NULL);
-
 	return xsk_info;
 
 error_exit:
@@ -371,10 +444,35 @@ static bool process_ack(struct xsk_socket_info *xsk)
 	return true;
 }
 
+void format_time(time_t* timestamp) {
+	long mytime = (*timestamp) / 1e9;
+    struct tm *tm_info = localtime(&mytime);
+    char buffer[256];
+    strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", tm_info);  // 自定义格式[3,6](@ref)
+	printf("recv_ts: %s.%09ld\n", buffer, (*timestamp) % 1000000000);	
+
+}
+
 static bool process_packet(struct xsk_socket_info *xsk,
 			   uint64_t addr, uint32_t len)
 {
 	unsigned long* timestamp = xsk_umem__get_data(xsk->umem->buffer, addr);
+	if(!xsk->timestamp)
+	{
+		// printf("addr:%llx\n", addr);
+		// printf("timestamp:%llu\n", (*timestamp));	
+		xsk->timestamp = *timestamp;
+		// format_time(timestamp);
+		xsk->base_rtt = *timestamp - xsk->start_ts;
+		printf("base rtt is %lu.%06ld ms\n", xsk->base_rtt / 1000000, xsk->base_rtt % 1000000);
+		update_base_rtt(&xsk->ptcp_info, xsk->base_rtt / 1000);
+	}
+	// if(!xsk->base_rtt && xsk->start_ts)
+	// {
+	// 	xsk->base_rtt = *timestamp - xsk->start_ts;
+	// 	printf("start_ts:%lu us\n", xsk->start_ts);
+	// 	printf("base_rtt:%lu us\n", xsk->base_rtt);
+	// }
 	// printf("timestamp:%lu\n", *timestamp);
 	struct ethhdr *eth_hdr = (struct ethhdr *)(timestamp + 1);
 	struct iphdr *ip_hdr = (struct iphdr *)(eth_hdr + 1);
@@ -386,7 +484,7 @@ static bool process_packet(struct xsk_socket_info *xsk,
 	// 	printf("tcp_hdr->rst:%d\n", tcp_hdr->rst);
 	// 	hex_dump(eth_hdr, len, addr);
 	// }
-// #define PARSER_TCPINT
+#define PARSER_TCPINT
 #ifdef PARSER_TCPINT
 	assert(tcp_hdr->doff == 8);
 	struct tcp_int_opt *tcp_int = (struct tcp_int_opt *)(tcp_hdr + 1);
@@ -402,7 +500,7 @@ static bool process_packet(struct xsk_socket_info *xsk,
 		build_tcp_header(tcp_hdr,ntohs(tcp_hdr->dest), ntohs(tcp_hdr->source),ntohl(tcp_hdr->ack_seq), 
 			ntohl(tcp_hdr->seq) + ntohs(ip_hdr->tot_len) - sizeof(struct iphdr) - sizeof(struct tcphdr) - sizeof(struct tcp_int_opt), true, true);
 #ifdef PARSER_TCPINT		
-		parser_tcpint_header(tcp_int, &xsk->istate);
+		parser_tcpint_header(tcp_int, &xsk->istate, *timestamp);
 		build_tcpint_header(tcp_int, &xsk->istate);
 #endif
 		while(xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx) < 1);
@@ -422,7 +520,10 @@ static bool process_packet(struct xsk_socket_info *xsk,
 		// }
 		//assert(ntohl(tcp_hdr->ack_seq) <= xsk->send_seq && ntohl(tcp_hdr->ack_seq) >= xsk->unack_seq);
 		xsk->recv_seq = ntohl(tcp_hdr->seq);
-		process_ack(xsk);
+#ifdef PARSER_TCPINT	
+		parser_tcpint_header(tcp_int, &xsk->istate, *timestamp);
+#endif
+		powertcp_cong_control(&xsk->ptcp_info, &xsk->istate);
 		xsk->unack_seq = ntohl(tcp_hdr->ack_seq);
 		return false;
 	}
@@ -444,8 +545,9 @@ static void handle_receive_packets(struct xsk_socket_info *xsk)
 		uint64_t addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx)->addr;
 		uint32_t len = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx++)->len;
 		need_tx = process_packet(xsk, addr, len);
+		// printf("addr:%llx,len:%u\n", addr, len);
 		if(!need_tx)
-			xsk_free_umem_frame(xsk, addr, 0);
+			xsk_free_umem_frame(xsk, addr + 8 - (1 << 8), 0);
 		xsk->stats.rx_bytes += len;
 	}
 	xsk_ring_cons__release(&xsk->rx, rcv_frames);
@@ -498,15 +600,30 @@ static void tx_and_process(struct config* cfg, struct xsk_socket_info *xsk)
 	unsigned int completed_frames, stock_frames;
 	uint64_t count = 0;
     uint32_t cq_idx = 0,tx_idx = 0;
+	uint64_t cq_addr;
     char payload[1448];
     memset(payload, 'a', sizeof(payload));
 	start_t = gettime();
+	struct xsk_tx_metadata *meta;
+	struct xdp_desc *tx_desc;
+	bool first_packet = true, first_recv = false;
     while(!global_exit) {
 		completed_frames = xsk_ring_cons__peek(&xsk->umem->cq, XSK_RING_CONS__DEFAULT_NUM_DESCS, &cq_idx);
 		for(int i = 0; i < completed_frames; i++)
 		{
+			cq_addr = *xsk_ring_cons__comp_addr(&xsk->umem->cq, cq_idx++);
+			// if(first_recv)
+			// {
+			// 	meta = xsk_umem__get_data(xsk->umem->buffer, cq_addr) - sizeof(struct xsk_tx_metadata);
+			// 	// xsk->start_ts = meta->completion.tx_timestamp;
+			// 	// printf("cq_addr=%llx,idx=%u,start_ts=%lu\n", cq_addr,cq_idx,xsk->start_ts);
+			// 	// first_recv = false;
+			// 	cq_addr = cq_addr - sizeof(struct xsk_tx_metadata);
+			// 	printf("cq_addr=%llx,idx=%u\n", cq_addr,cq_idx);
+			// }
+			// exit_application(0);
 			// printf("free frame addr:%lu\n", *xsk_ring_cons__comp_addr(&xsk->umem->cq, cq_idx));
-			xsk_free_umem_frame(xsk, *xsk_ring_cons__comp_addr(&xsk->umem->cq, cq_idx++), 1);
+			xsk_free_umem_frame(xsk, cq_addr, 1);
 		}
 		//释放cq
 		xsk_ring_cons__release(&xsk->umem->cq, completed_frames);
@@ -529,10 +646,21 @@ static void tx_and_process(struct config* cfg, struct xsk_socket_info *xsk)
 		//构建数据包
 		for(int i = 0; i < stock_frames; i++)
 		{
-			xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = xsk_alloc_umem_frame(xsk,1);
-        	xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = sizeof(struct ethhdr) + sizeof(struct iphdr) + 
+			tx_desc = xsk_ring_prod__tx_desc(&xsk->tx, tx_idx);
+			tx_desc->addr = xsk_alloc_umem_frame(xsk,1);
+			// printf("tx_desc->addr:%lx\n", tx_desc->addr);
+			// if(first_packet)
+			// 	tx_desc->addr += sizeof(struct xsk_tx_metadata);
+        	tx_desc->len = sizeof(struct ethhdr) + sizeof(struct iphdr) + 
 																sizeof(struct tcphdr) + sizeof(struct tcp_int_opt) + sizeof(payload);
-			void* pkt = (char *) xsk_umem__get_data(xsk->umem->buffer, xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr);
+			void* pkt = (char *) xsk_umem__get_data(xsk->umem->buffer, tx_desc->addr);
+			// if(first_packet)
+			// {
+			// 	//printf("addr:%llx,idx=%u\n", tx_desc->addr,tx_idx);
+			// 	meta = pkt - sizeof(struct xsk_tx_metadata);
+			// 	memset(meta, 0, sizeof(*meta));
+			// 	meta->flags = XDP_TXMD_FLAGS_TIMESTAMP;
+			// }
 			struct ethhdr *eth_hdr = (struct ethhdr *) pkt;
 			struct iphdr *ip_hdr = (struct iphdr *) (eth_hdr + 1);
 			struct tcphdr *tcp_hdr = (struct tcphdr *) (ip_hdr + 1);
@@ -545,18 +673,37 @@ static void tx_and_process(struct config* cfg, struct xsk_socket_info *xsk)
 			xsk->send_seq += sizeof(payload);
 			//memcpy(udp_hdr + 1, payload, sizeof(payload));	
 			xsk->stats.tx_packets ++;
-			xsk->stats.tx_bytes += xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len;
+			// if(first_packet)
+			// {
+			// 	tx_desc->options |= XDP_TX_METADATA;
+			// 	// first_packet = false;
+			// }
+			xsk->stats.tx_bytes += tx_desc->len;
 			tx_idx++;
 		}
 		//提交数据包
 		xsk_ring_prod__submit(&xsk->tx, stock_frames);
 			// printf(xsk_ring_prod__needs_wakeup(&xsk->tx) ? "needs wakeup\n" : "no need wakeup\n");
+
 		sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+		if(first_packet)
+		{
+			struct timespec ts;
+			clock_gettime(CLOCK_TAI, &ts);
+			struct tm* local_time;
+			// local_time = localtime(&ts.tv_sec); 
+			xsk->start_ts = ts.tv_sec * NSEC_PER_SEC + ts.tv_nsec;
+			// char time_str[64];
+			// strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", local_time);
+			// printf("start time: %s.%09ld\n", time_str, ts.tv_nsec);
+			// printf("start_ts:%llu \n", xsk->start_ts);
+			first_packet = false;
+		}
 		xsk->outstanding_tx_frames += stock_frames;
 
 		// printf("this time send %d packets, completed %d packets\n", stock_frames,completed_frames);
 		end_t = gettime();
-		if(end_t - start_t > 6 * 1e9)
+		if(end_t - start_t > 0.1 * 1e9)
 			exit_application(0);	
     }
 
@@ -584,6 +731,36 @@ static void* rx_and_process(void * arg)
 	return NULL;
 }
 
+static void hwtstamp_ioctl(int op, const char *ifname, struct hwtstamp_config *cfg)
+{
+	struct ifreq ifr = {
+		.ifr_data = (void *)cfg,
+	};
+	int fd, ret;
+
+	strncpy(ifr.ifr_name, ifname, IF_NAMESIZE - 1);
+
+	fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+	if (fd < 0)
+		printf("error: socket(%s): %s\n", ifname, strerror(errno));
+
+	ret = ioctl(fd, op, &ifr);
+	if (ret < 0)
+		printf("error: ioctl(%s): %s\n", ifname, strerror(errno));
+		//error(1, errno, "ioctl(%d)", op);
+
+	close(fd);
+}
+
+static void hwtstamp_enable(const char *ifname)
+{
+	struct hwtstamp_config cfg = {
+		.rx_filter = HWTSTAMP_FILTER_ALL,
+		.tx_type = HWTSTAMP_TX_ON,
+	};
+
+	hwtstamp_ioctl(SIOCSHWTSTAMP, ifname, &cfg);
+}
 
 int main(int argc, char **argv)
 {
@@ -621,6 +798,7 @@ int main(int argc, char **argv)
 		usage(argv[0], __doc__, long_options, (argc == 1));
 		return EXIT_FAIL_OPTION;
 	}
+	// hwtstamp_enable(cfg.ifname);
 	/* Load custom program if configured */
 	if (cfg.filename[0] != 0) {
 		struct bpf_map *map;
@@ -687,7 +865,7 @@ int main(int argc, char **argv)
 			strerror(errno));
 		exit(EXIT_FAILURE);
 	}
-
+	powertcp_init(&xsk_socket->ptcp_info, 50, 10000,512);
 	/* Start thread to do statistics display */
 	if (verbose) {
 		ret = pthread_create(&stats_poll_thread, NULL, stats_poll,

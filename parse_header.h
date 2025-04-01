@@ -8,7 +8,14 @@
 #include <arpa/inet.h>
 #include <bpf/bpf_endian.h>
 #include "checksum.h"
+// #include "powertcp.h"
 // 构建以太网帧
+
+#define NUM_FRAMES         2 * XSK_RING_CONS__DEFAULT_NUM_DESCS
+#define FRAME_SIZE         XSK_UMEM__DEFAULT_FRAME_SIZE
+#define RX_BATCH_SIZE      64
+#define INVALID_UMEM_FRAME UINT64_MAX
+#define ETH_ALEN 6
 
 struct uint24 {
     unsigned u24 : 24;
@@ -37,6 +44,14 @@ struct tcp_int_state
     uint16_t hoplatecr; /* Sum of hop latencies on data path */
     uint8_t linkspeedecr;
     uint32_t util;
+    uint64_t timestamp;
+};
+
+struct xsk_umem_info {
+	struct xsk_ring_prod fq;
+	struct xsk_ring_cons cq;
+	struct xsk_umem *umem;
+	void *buffer;
 };
 
 #define TCP_INT_UTIL_BITSHIFT 3
@@ -143,15 +158,18 @@ void build_tcpint_header(struct tcp_int_opt* tcp_int,  const struct tcp_int_stat
     tcp_int->hoplatecr = istate->hoplatecr;
 }
 
-void parser_tcpint_header(struct tcp_int_opt* iopt, struct tcp_int_state* istate)
+void parser_tcpint_header(struct tcp_int_opt* iopt, struct tcp_int_state* istate, uint64_t ts)
 {
-    if (iopt->id) {
+    // printf("iopt->id:%u\n", iopt->id);
+    // if (iopt->id)
+     {
         istate->intvalecr = iopt->intval;
         istate->idecr = tcp_int_id_to_idecr(iopt->id);
         istate->hoplatecr =
             tcp_int_hoplat_to_hoplatecr(be24tohl(iopt->hoplat.u24));
         istate->linkspeedecr = iopt->linkspeed;
         istate->pending_ecr = true;
+        istate->timestamp = ts;
     }
 
     /* Ignore local events with no updates */
